@@ -447,6 +447,10 @@ pub struct H3Driver<H: DriverHooks> {
 
     /// The maximum HTTP/3 stream ID seen on this connection.
     max_stream_seen: u64,
+    /// The first request stream ID not yet seen on this connection.
+    next_stream_unseen: u64,
+    /// From [`Http3Settings::goaway_names_next_request`].
+    goaway_names_next_request: bool,
 
     /// Tracks whether we have forwarded the HTTP/3 SETTINGS frame
     /// to the [H3Controller] once.
@@ -483,6 +487,9 @@ impl<H: DriverHooks> H3Driver<H> {
                 dgram_recv,
                 dgram_send: PollSender::new(dgram_send),
                 max_stream_seen: 0,
+                next_stream_unseen: 0,
+                goaway_names_next_request: http3_settings
+                    .goaway_names_next_request,
                 body_recv_buf: None,
                 // `Some(0)` would make `recv_body_buf` a no-op, so treat it as
                 // unset.
@@ -557,6 +564,8 @@ impl<H: DriverHooks> H3Driver<H> {
     fn insert_stream(&mut self, stream_id: u64, ctx: StreamCtx) {
         self.stream_map.insert(stream_id, ctx);
         self.max_stream_seen = self.max_stream_seen.max(stream_id);
+        self.next_stream_unseen =
+            self.next_stream_unseen.max(stream_id.saturating_add(4));
     }
 
     /// Fetches body chunks from the [`quiche::h3::Connection`] and forwards
@@ -1227,7 +1236,17 @@ impl<H: DriverHooks> H3Driver<H> {
         match cmd {
             H3Command::QuicCmd(cmd) => cmd.execute(qconn),
             H3Command::GoAway => {
-                let max_id = self.max_stream_seen;
+                let max_id = if self.goaway_names_next_request {
+                    // Once the last request stream ID is consumed, no valid
+                    // GOAWAY ID lies past it, and the peer cannot open
+                    // another request.
+                    if self.next_stream_unseen > octets::MAX_VAR_INT {
+                        return Ok(());
+                    }
+                    self.next_stream_unseen
+                } else {
+                    self.max_stream_seen
+                };
                 self.conn_mut()
                     .expect("connection should be established")
                     .send_goaway(qconn, max_id)?;

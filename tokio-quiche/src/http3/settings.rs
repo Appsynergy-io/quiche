@@ -74,6 +74,17 @@ pub struct Http3Settings {
     ///
     /// When unset or `Some(0)`, the driver defaults to 16 KiB.
     pub max_recv_body_buf_size: Option<usize>,
+    /// Treat a request's trailer section that carries a pseudo-header, a field
+    /// name that is not a lower-case token, or a value holding CR, LF or NUL
+    /// as a malformed request: the stream is reset with `H3_MESSAGE_ERROR` in
+    /// both directions. See <https://www.rfc-editor.org/rfc/rfc9114#section-4.1.2>
+    /// and <https://www.rfc-editor.org/rfc/rfc9114#section-4.3>. Only
+    /// applicable to [ServerH3Driver](crate::http3::driver::ServerH3Driver).
+    pub reject_malformed_trailers: bool,
+    /// Name the first request stream not yet received in a server's GOAWAY,
+    /// so every request already received is still served. See
+    /// <https://www.rfc-editor.org/rfc/rfc9114#section-5.2>.
+    pub goaway_names_next_request: bool,
 }
 
 impl From<&Http3Settings> for quiche::h3::Config {

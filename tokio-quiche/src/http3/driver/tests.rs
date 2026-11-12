@@ -3625,6 +3625,253 @@ mod server_side_driver {
             "flow_map should remain empty when extended connect is disabled"
         );
     }
+    fn server_helper_with(
+        h3_settings: Http3Settings,
+    ) -> DriverTestHelper<ServerHooks> {
+        let mut helper =
+            DriverTestHelper::<ServerHooks>::with_pipe_and_http3_settings(
+                quiche::test_utils::Pipe::with_config_and_buf(
+                    &mut default_quiche_config(),
+                )
+                .unwrap(),
+                h3_settings,
+            )
+            .unwrap();
+        helper.complete_handshake().unwrap();
+        helper.advance_and_run_loop().unwrap();
+        helper
+    }
+
+    /// Sends a POST whose body is followed by `trailers` and FIN, and returns
+    /// the request the server driver surfaced.
+    fn send_request_with_trailers(
+        helper: &mut DriverTestHelper<ServerHooks>, trailers: &[h3::Header],
+    ) -> IncomingH3Headers {
+        let stream_id = helper
+            .peer_client_send_request(make_request_headers("POST"), false)
+            .unwrap();
+        helper.advance_and_run_loop().unwrap();
+        let req = assert_matches!(
+            helper.driver_recv_server_event().unwrap(),
+            ServerH3Event::Headers{incoming_headers, ..} => { incoming_headers }
+        );
+        assert_eq!(req.stream_id, stream_id);
+
+        assert_eq!(
+            helper.peer_client_send_body(stream_id, &[1; 5], false),
+            Ok(5)
+        );
+        helper
+            .peer
+            .send_additional_headers(
+                &mut helper.pipe.client,
+                stream_id,
+                trailers,
+                true,
+                true,
+            )
+            .unwrap();
+        helper.advance_and_run_loop().unwrap();
+        req
+    }
+
+    /// With `reject_malformed_trailers`, a trailer section that is malformed
+    /// (RFC 9114 Section 4.1.2) resets the request stream with
+    /// H3_MESSAGE_ERROR in both directions.
+    #[rstest]
+    #[case::pseudo_header(vec![h3::Header::new(b":path", b"/")])]
+    #[case::cr_in_value(vec![h3::Header::new(b"trailer", b"a\rb")])]
+    #[case::lf_in_value(vec![h3::Header::new(b"trailer", b"a\nb")])]
+    #[case::nul_in_value(vec![h3::Header::new(b"trailer", b"a\0b")])]
+    fn server_rejects_malformed_trailers(#[case] trailers: Vec<h3::Header>) {
+        const MESSAGE_ERROR: u64 = h3::WireErrorCode::MessageError as u64;
+
+        let mut helper = server_helper_with(Http3Settings {
+            reject_malformed_trailers: true,
+            ..Default::default()
+        });
+        let req = send_request_with_trailers(&mut helper, &trailers);
+        let audit_stats = req.h3_audit_stats.clone();
+
+        assert_eq!(
+            helper.peer_client_poll(),
+            Ok((req.stream_id, h3::Event::Reset(MESSAGE_ERROR)))
+        );
+        assert_eq!(
+            audit_stats.sent_reset_stream_error_code(),
+            MESSAGE_ERROR as i64
+        );
+        assert_eq!(
+            audit_stats.sent_stop_sending_error_code(),
+            MESSAGE_ERROR as i64
+        );
+        assert!(!helper.driver.stream_map.contains_key(&req.stream_id));
+    }
+
+    /// With `reject_malformed_trailers`, a well-formed trailer section is
+    /// accepted and the request completes.
+    #[test]
+    fn server_accepts_well_formed_trailers_when_rejecting_malformed() {
+        let mut helper = server_helper_with(Http3Settings {
+            reject_malformed_trailers: true,
+            ..Default::default()
+        });
+        let trailers = vec![h3::Header::new(b"x-checksum", b"abc")];
+        let mut req = send_request_with_trailers(&mut helper, &trailers);
+        assert_server_ignores_trailers(&mut helper, &mut req);
+    }
+
+    /// Without `reject_malformed_trailers`, upstream's behaviour is
+    /// unchanged: any trailer section is ignored and the request completes.
+    #[test]
+    fn server_ignores_malformed_trailers_by_default() {
+        let mut helper = server_helper_with(Http3Settings::default());
+        let trailers = vec![h3::Header::new(b":path", b"/")];
+        let mut req = send_request_with_trailers(&mut helper, &trailers);
+        assert_server_ignores_trailers(&mut helper, &mut req);
+    }
+
+    fn assert_server_ignores_trailers(
+        helper: &mut DriverTestHelper<ServerHooks>, req: &mut IncomingH3Headers,
+    ) {
+        let (body, fin, err) = helper.driver_try_recv_body(&mut req.recv);
+        assert_eq!(body, vec![1; 5]);
+        assert!(fin);
+        assert_eq!(err, TryRecvError::Disconnected);
+        assert_eq!(req.h3_audit_stats.sent_reset_stream_error_code(), -1);
+        assert_eq!(req.h3_audit_stats.sent_stop_sending_error_code(), -1);
+
+        let to_client = req.send.get_ref().unwrap().clone();
+        to_client
+            .try_send(OutboundFrame::Headers(make_response_headers(), None))
+            .unwrap();
+        helper.advance_and_run_loop().unwrap();
+        assert_matches!(
+            helper.peer_client_poll(),
+            Ok((0, h3::Event::Headers { .. }))
+        );
+        to_client
+            .try_send(OutboundFrame::Body(Bytes::copy_from_slice(&[42]), true))
+            .unwrap();
+        helper.advance_and_run_loop().unwrap();
+        assert_eq!(helper.peer_client_poll(), Ok((0, h3::Event::Data)));
+        assert_eq!(helper.peer_client_recv_body_vec(0, 1024), Ok(vec![42]));
+        assert_eq!(helper.peer_client_poll(), Ok((0, h3::Event::Finished)));
+    }
+
+    /// The trailer-section check refuses the field names RFC 9114 Section 4.2
+    /// and RFC 9110 Section 5.1 do not allow, which a quiche peer's QPACK
+    /// encoder cannot put on the wire.
+    #[test]
+    fn trailer_section_well_formedness() {
+        use super::super::server::trailer_section_is_well_formed;
+
+        let ok = |name: &[u8], value: &[u8]| {
+            trailer_section_is_well_formed(&[h3::Header::new(name, value)])
+        };
+        assert!(trailer_section_is_well_formed(&[]));
+        assert!(ok(b"x-checksum", b"abc"));
+        assert!(ok(b"!#$%&'*+-.^_`|~09az", b""));
+        assert!(!ok(b"", b"a"));
+        assert!(!ok(b"X-Checksum", b"abc"));
+        assert!(!ok(b":status", b"200"));
+        assert!(!ok(b"x checksum", b"abc"));
+        assert!(!ok(b"x-checksum", b"a\r\nb"));
+        assert!(!trailer_section_is_well_formed(&[
+            h3::Header::new(b"x-a", b"1"),
+            h3::Header::new(b"x-b", b"\0"),
+        ]));
+    }
+
+    /// Opens `count` requests from the client and lets the server driver
+    /// accept them.
+    fn open_requests(helper: &mut DriverTestHelper<ServerHooks>, count: u64) {
+        for i in 0..count {
+            let stream_id = helper
+                .peer_client_send_request(make_request_headers("GET"), true)
+                .unwrap();
+            assert_eq!(stream_id, i * 4);
+            helper.advance_and_run_loop().unwrap();
+            let req = loop {
+                match helper.driver_recv_server_event().unwrap() {
+                    ServerH3Event::Headers {
+                        incoming_headers, ..
+                    } => break incoming_headers,
+                    ServerH3Event::Core(H3Event::BodyBytesReceived {
+                        ..
+                    }) => continue,
+                    other => panic!("unexpected event: {other:?}"),
+                }
+            };
+            assert_eq!(req.stream_id, stream_id);
+        }
+    }
+
+    /// With `goaway_names_next_request`, the server's GOAWAY names the first
+    /// request stream not yet received (RFC 9114 Section 5.2): 0 when no
+    /// request was received, otherwise past every request received.
+    #[rstest]
+    #[case::no_request(0, 0)]
+    #[case::one_request(1, 4)]
+    #[case::two_requests(2, 8)]
+    fn server_goaway_names_next_request(
+        #[case] requests: u64, #[case] goaway_id: u64,
+    ) {
+        let mut helper = server_helper_with(Http3Settings {
+            goaway_names_next_request: true,
+            ..Default::default()
+        });
+        open_requests(&mut helper, requests);
+
+        helper.controller.send_goaway();
+        helper.advance_and_run_loop().unwrap();
+
+        assert_eq!(
+            helper.peer_client_poll(),
+            Ok((goaway_id, h3::Event::GoAway))
+        );
+    }
+
+    /// Without `goaway_names_next_request`, upstream's GOAWAY ID is
+    /// unchanged: the highest request stream ID received, or 0.
+    #[rstest]
+    #[case::no_request(0, 0)]
+    #[case::one_request(1, 0)]
+    #[case::two_requests(2, 4)]
+    fn server_goaway_names_max_stream_seen_by_default(
+        #[case] requests: u64, #[case] goaway_id: u64,
+    ) {
+        let mut helper = server_helper_with(Http3Settings::default());
+        open_requests(&mut helper, requests);
+
+        helper.controller.send_goaway();
+        helper.advance_and_run_loop().unwrap();
+
+        assert_eq!(
+            helper.peer_client_poll(),
+            Ok((goaway_id, h3::Event::GoAway))
+        );
+    }
+
+    /// With `goaway_names_next_request`, no GOAWAY is sent once the client
+    /// has used the last client-initiated bidirectional stream ID: no valid
+    /// GOAWAY ID lies past it, and the client cannot open another request.
+    #[test]
+    fn server_goaway_skipped_when_stream_ids_exhausted() {
+        let mut helper = server_helper_with(Http3Settings {
+            goaway_names_next_request: true,
+            ..Default::default()
+        });
+        // Opening 2^60 streams is infeasible, so record the last client
+        // bidirectional stream ID as received.
+        helper.driver.next_stream_unseen = octets::MAX_VAR_INT - 3 + 4;
+
+        helper.controller.send_goaway();
+        helper.advance_and_run_loop().unwrap();
+
+        assert_eq!(helper.peer_client_poll(), Err(h3::Error::Done));
+        assert!(!helper.pipe.server.is_closed());
+    }
 }
 
 /// Tests for HTTP/3 DATAGRAM flows (RFC 9297).

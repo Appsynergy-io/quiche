@@ -24,6 +24,8 @@
 // NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+use quiche::h3;
+use quiche::h3::NameValue;
 use std::ops::Deref;
 use std::sync::Arc;
 
@@ -43,6 +45,7 @@ use super::InboundFrame;
 use super::InboundHeaders;
 use super::IncomingH3Headers;
 use super::StreamCtx;
+use super::StreamShutdown;
 use super::STREAM_CAPACITY;
 use crate::http3::settings::Http3Settings;
 use crate::http3::settings::Http3SettingsEnforcer;
@@ -173,6 +176,26 @@ pub struct ServerHooks {
     /// Datagrams received before the corresponding CONNECT request has been
     /// processed. Bounded by [`datagram::PENDING_DGRAM_CAPACITY`].
     pending_dgrams: PendingDgramBuffer,
+    /// From [`Http3Settings::reject_malformed_trailers`].
+    reject_malformed_trailers: bool,
+}
+
+/// Whether a request's second HEADERS is a well-formed trailer section: no
+/// pseudo-header, and every field a lower-case token carrying no CR, LF or
+/// NUL. See <https://www.rfc-editor.org/rfc/rfc9114#section-4.1.2>.
+pub(super) fn trailer_section_is_well_formed(headers: &[h3::Header]) -> bool {
+    headers.iter().all(|h| {
+        let name = h.name();
+        !name.is_empty() &&
+            name.iter().all(|&b| {
+                b.is_ascii_lowercase() ||
+                    b.is_ascii_digit() ||
+                    b"!#$%&'*+-.^_`|~".contains(&b)
+            }) &&
+            !h.value()
+                .iter()
+                .any(|&b| b == b'\r' || b == b'\n' || b == 0)
+    })
 }
 
 impl ServerHooks {
@@ -194,6 +217,19 @@ impl ServerHooks {
         // the first one is an actual request. For now ignore any additional
         // HEADERS (e.g. "trailers").
         if driver.stream_map.contains_key(&stream_id) {
+            if driver.hooks.reject_malformed_trailers &&
+                !trailer_section_is_well_formed(&headers)
+            {
+                let code = h3::WireErrorCode::MessageError as u64;
+                return driver.shutdown_stream(
+                    qconn,
+                    stream_id,
+                    StreamShutdown::Both {
+                        read_error_code: code,
+                        write_error_code: code,
+                    },
+                );
+            }
             return Ok(());
         }
 
@@ -299,6 +335,7 @@ impl DriverHooks for ServerHooks {
             post_accept_timeout: None,
             extended_connect_enabled: settings.enable_extended_connect,
             pending_dgrams: PendingDgramBuffer::new(),
+            reject_malformed_trailers: settings.reject_malformed_trailers,
         }
     }
 
